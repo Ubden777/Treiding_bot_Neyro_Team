@@ -18,9 +18,6 @@ import time  # Для задержек и кэша
 import json
 import requests
 
-
-
-
 load_dotenv()
 
 cg = CoinGeckoAPI()
@@ -40,28 +37,61 @@ logging.basicConfig(level=logging.INFO)
 def load_coins_list(force_update=False):
     file = 'coins.json'
     if os.path.exists(file) and not force_update:
-        with open(file, 'r') as f:
-            data = json.load(f)
-        if time.time() - data.get('timestamp', 0) < 86400:  # 24 часа
-            logging.info("Список монет из кэша")
-            return data['coins']
+        try:
+            with open(file, 'r') as f:
+                data = json.load(f)
+            if time.time() - data.get('timestamp', 0) < 86400:  # 24 часа
+                logging.info("Loading coins list from cache.")
+                return data.get('coins', [])
+        except (json.JSONDecodeError, KeyError):
+            logging.warning("Couldn't read cached coins.json, forcing update.")
 
+    logging.info("Fetching updated coins list from CoinGecko and Bybit.")
     try:
-        time.sleep(1)  # Задержка для лимита
+        # 1. Fetch all coins from CoinGecko
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}  # Чтобы избежать блоков
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
         response = requests.get("https://api.coingecko.com/api/v3/coins/list", headers=headers)
         response.raise_for_status()
-        coins = response.json()
-        if not coins:
-            logging.warning("Пустой список от CoinGecko, возможно лимит")
-            return []
+        all_coins = response.json()
+        if not all_coins:
+            raise ValueError("Received empty list from CoinGecko API.")
+
+        # 2. Fetch all linear USDT pairs from Bybit
+        session = httpx.Client()
+        params = {"category": "linear"}
+        bybit_response = session.get(f"{BASE_URL}/v5/market/tickers", params=params)
+        bybit_response.raise_for_status()
+        bybit_data = bybit_response.json()
+
+        if bybit_data.get("retCode") != 0:
+            raise ConnectionError(f"Bybit API returned error: {bybit_data.get('retMsg')}")
+
+        bybit_tickers = bybit_data.get('result', {}).get('list', [])
+        usdt_pairs = {ticker['symbol'] for ticker in bybit_tickers if ticker['symbol'].endswith('USDT')}
+
+        # 3. Filter CoinGecko list against Bybit's USDT pairs
+        filtered_coins = [
+            coin for coin in all_coins if f"{coin['symbol'].upper()}USDT" in usdt_pairs
+        ]
+
+        # 4. Save the filtered list to coins.json
         with open(file, 'w') as f:
-            json.dump({'coins': coins, 'timestamp': time.time()}, f)
-        logging.info("Список монет обновлён, загружено {len(coins)} монет")
-        return coins
+            json.dump({'coins': filtered_coins, 'timestamp': time.time()}, f)
+
+        logging.info(f"Coins list updated successfully. Found {len(filtered_coins)} tradable USDT pairs.")
+        return filtered_coins
+
     except Exception as e:
-        logging.error(f"Ошибка загрузки списка монет: {e}")
+        logging.error(f"Failed to update coins list: {e}")
+        # Fallback to existing file if update fails
+        if os.path.exists(file):
+            with open(file, 'r') as f:
+                try:
+                    return json.load(f).get('coins', [])
+                except (json.JSONDecodeError, KeyError):
+                    return []
         return []
 
 
@@ -86,7 +116,7 @@ def get_stock_data(symbol: str, interval: str, limit: int):
     if df.empty:
         raise ValueError(f"No data from yfinance for {symbol}")
     df.reset_index(inplace=True)
-    df['timestamp'] = (df['Date'].astype('int64') // 10**6).astype(int)  # ms
+    df['timestamp'] = (df['Date'].astype('int64') // 10 ** 6).astype(int)  # ms
     kline_data = df[['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']].values.tolist()[-limit:]  # 6 columns
     # Aggregation for long TF
     if interval in ['1m', '6m', '1y']:
@@ -121,6 +151,7 @@ def get_stock_data(symbol: str, interval: str, limit: int):
     }
     return market_data
 
+
 # Функция для получения клайн данных (с кэшем и задержкой)
 async def get_kline_data(session, symbol: str, interval: str, limit: int = 100) -> list | None:
     cache_key = f"kline_{symbol}_{interval}"
@@ -152,6 +183,7 @@ async def get_kline_data(session, symbol: str, interval: str, limit: int = 100) 
     except Exception as e:
         logging.error(f"Ошибка Bybit kline: {e}")
         return None
+
 
 # Функция для расчёта MVRV (derive из CoinGecko)
 def derive_mvrv(symbol: str):
@@ -192,6 +224,7 @@ def derive_puell(symbol: str):
         logging.error(f"Ошибка derive Puell: {e}")
         return {"value": 1, "interpretation": "N/A"}
 
+
 # Пропущенная функция get_macro_data (для макро из yfinance)
 def get_macro_data(symbol: str):
     try:
@@ -229,6 +262,7 @@ def get_macro_data(symbol: str):
     except Exception as e:
         logging.error(f"Ошибка macro: {e}")
         return {"sp500_corr": 0, "etf_inflows": 0, "interpretation": "N/A"}
+
 
 # Пропущенная функция backtest_probabilities (простой backtest на kline)
 def backtest_probabilities(symbol: str, timeframe: str):
@@ -320,7 +354,8 @@ def get_onchain_data(symbol: str):
 
 
 # Функция для получения данных (с derive)
-async def get_market_data(symbol: str, timeframe: str, limit: int = 365, is_vip: bool = False, category: str = 'linear'):
+async def get_market_data(symbol: str, timeframe: str, limit: int = 365, is_vip: bool = False,
+                          category: str = 'linear'):
     try:
         # Kline
         session = httpx.AsyncClient()
@@ -407,7 +442,7 @@ def aggregate_kline(kline: list, period: int, freq: str) -> list:
         df_grouped = df_resampled.groupby(grouper).agg(agg)
 
         df_grouped.reset_index(inplace=True)
-        df_grouped['timestamp'] = df_grouped['timestamp'].astype('int64') // 10**6
+        df_grouped['timestamp'] = df_grouped['timestamp'].astype('int64') // 10 ** 6
         df_grouped['timestamp'] = df_grouped['timestamp'].astype(int)
 
         if period == 1:
@@ -421,6 +456,7 @@ def aggregate_kline(kline: list, period: int, freq: str) -> list:
     except Exception as e:
         logging.error(f"Aggregate kline error: {e}")
         return []
+
 
 async def get_derivatives_info(session, symbol: str) -> dict | None:
     """Получает данные по открытому интересу и ставке финансирования."""
@@ -446,6 +482,7 @@ async def get_derivatives_info(session, symbol: str) -> dict | None:
     except Exception as e:
         print(f"An unexpected error occurred in get_derivatives_info: {e}")
         return None
+
 
 # --- НОВЫЕ ФУНКЦИИ-СИМУЛЯТОРЫ ON-CHAIN ДАННЫХ ---
 # bybit_api.py (БЛОК: get_exchange_netflow и get_lth_sopr - заменить полностью)
@@ -555,6 +592,7 @@ symbol_to_id = {
     # Добавьте больше популярных монет по необходимости
 }
 
+
 async def get_exchange_netflow(symbol: str) -> dict:
     try:
         coin_id = get_coin_id(symbol)
@@ -569,6 +607,7 @@ async def get_exchange_netflow(symbol: str) -> dict:
     except Exception as e:
         logging.error(f"Netflow error: {e}")
         return {"value": 0, "interpretation": "N/A"}
+
 
 async def get_lth_sopr(symbol: str) -> dict:
     try:
@@ -586,6 +625,7 @@ async def get_lth_sopr(symbol: str) -> dict:
     except Exception as e:
         logging.error(f"SOPR error: {e}")
         return {"value": 1.0, "interpretation": "N/A"}
+
 
 # --- КОНЕЦ НОВЫХ ФУНКЦИЙ ---
 
@@ -683,7 +723,8 @@ def calculate_advanced_metrics(kline_data: list) -> dict:
 
     vwap_length = max(1, min(14, len_df))
     try:
-        vwap = ta.vwap(high=df['high'], low=df['low'], close=df['close'], volume=df['volume'], length=vwap_length).iloc[-1]
+        vwap = ta.vwap(high=df['high'], low=df['low'], close=df['close'], volume=df['volume'], length=vwap_length).iloc[
+            -1]
     except Exception as e:
         logging.error(f"VWAP calculation error: {e}")
         vwap = last_price
@@ -796,15 +837,18 @@ def plot_chart(market_data: dict, timeframe: str, is_vip: bool = False):
         ax1.axhline(resistance, color='red', linestyle='--', label='Resistance', linewidth=1.2)
         last_close = df['close'].iloc[-1]
         ax1.annotate(f"Price: {last_close:.2f}", xy=(df.index[-1], last_close), xytext=(10, 10),
-                     textcoords='offset points', arrowprops=dict(arrowstyle="->", color='black'), fontsize=10, color='black')
+                     textcoords='offset points', arrowprops=dict(arrowstyle="->", color='black'), fontsize=10,
+                     color='black')
         if rsi is not None:
             last_rsi = rsi.iloc[-1]
             if last_rsi > 70:
                 ax2.annotate("Overbought", xy=(df.index[-1], last_rsi), xytext=(10, -10),
-                             textcoords='offset points', arrowprops=dict(arrowstyle="->", color='red'), color='red', fontsize=10)
+                             textcoords='offset points', arrowprops=dict(arrowstyle="->", color='red'), color='red',
+                             fontsize=10)
             elif last_rsi < 30:
                 ax2.annotate("Oversold", xy=(df.index[-1], last_rsi), xytext=(10, 10),
-                             textcoords='offset points', arrowprops=dict(arrowstyle="->", color='green'), color='green', fontsize=10)
+                             textcoords='offset points', arrowprops=dict(arrowstyle="->", color='green'), color='green',
+                             fontsize=10)
 
     ax1.legend(loc='upper left', fontsize=8)
     ax1.tick_params(axis='x', rotation=45, labelsize=8)
@@ -829,4 +873,5 @@ def plot_chart(market_data: dict, timeframe: str, is_vip: bool = False):
     fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
     buf.seek(0)
     plt.close(fig)
+
     return buf
