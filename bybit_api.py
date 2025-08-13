@@ -40,30 +40,62 @@ logging.basicConfig(level=logging.INFO)
 def load_coins_list(force_update=False):
     file = 'coins.json'
     if os.path.exists(file) and not force_update:
-        with open(file, 'r') as f:
-            data = json.load(f)
-        if time.time() - data.get('timestamp', 0) < 86400:  # 24 часа
-            logging.info("Список монет из кэша")
-            return data['coins']
+        try:
+            with open(file, 'r') as f:
+                data = json.load(f)
+            if time.time() - data.get('timestamp', 0) < 86400:  # 24 часа
+                logging.info("Loading coins list from cache.")
+                return data.get('coins', [])
+        except (json.JSONDecodeError, KeyError):
+            logging.warning("Couldn't read cached coins.json, forcing update.")
 
+    logging.info("Fetching updated coins list from CoinGecko and Bybit.")
     try:
-        time.sleep(1)  # Задержка для лимита
+        # 1. Fetch all coins from CoinGecko
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}  # Чтобы избежать блоков
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
         response = requests.get("https://api.coingecko.com/api/v3/coins/list", headers=headers)
         response.raise_for_status()
-        coins = response.json()
-        if not coins:
-            logging.warning("Пустой список от CoinGecko, возможно лимит")
-            return []
-        with open(file, 'w') as f:
-            json.dump({'coins': coins, 'timestamp': time.time()}, f)
-        logging.info("Список монет обновлён, загружено {len(coins)} монет")
-        return coins
-    except Exception as e:
-        logging.error(f"Ошибка загрузки списка монет: {e}")
-        return []
+        all_coins = response.json()
+        if not all_coins:
+            raise ValueError("Received empty list from CoinGecko API.")
 
+        # 2. Fetch all linear USDT pairs from Bybit
+        session = httpx.Client()
+        params = {"category": "linear"}
+        bybit_response = session.get(f"{BASE_URL}/v5/market/tickers", params=params)
+        bybit_response.raise_for_status()
+        bybit_data = bybit_response.json()
+        
+        if bybit_data.get("retCode") != 0:
+            raise ConnectionError(f"Bybit API returned error: {bybit_data.get('retMsg')}")
+            
+        bybit_tickers = bybit_data.get('result', {}).get('list', [])
+        usdt_pairs = {ticker['symbol'] for ticker in bybit_tickers if ticker['symbol'].endswith('USDT')}
+
+        # 3. Filter CoinGecko list against Bybit's USDT pairs
+        filtered_coins = [
+            coin for coin in all_coins if f"{coin['symbol'].upper()}USDT" in usdt_pairs
+        ]
+
+        # 4. Save the filtered list to coins.json
+        with open(file, 'w') as f:
+            json.dump({'coins': filtered_coins, 'timestamp': time.time()}, f)
+        
+        logging.info(f"Coins list updated successfully. Found {len(filtered_coins)} tradable USDT pairs.")
+        return filtered_coins
+
+    except Exception as e:
+        logging.error(f"Failed to update coins list: {e}")
+        # Fallback to existing file if update fails
+        if os.path.exists(file):
+            with open(file, 'r') as f:
+                try:
+                    return json.load(f).get('coins', [])
+                except (json.JSONDecodeError, KeyError):
+                    return []
+        return []
 
 # Функция для поиска coin_id по symbol (e.g., 'ton' -> 'the-open-network')
 def get_coin_id(symbol: str):
@@ -829,4 +861,5 @@ def plot_chart(market_data: dict, timeframe: str, is_vip: bool = False):
     fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
     buf.seek(0)
     plt.close(fig)
+
     return buf
