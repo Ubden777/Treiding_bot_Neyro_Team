@@ -19,7 +19,7 @@ import html
 from aiogram.types import CallbackQuery
 from openai import OpenAI
 from aiogram.enums import ParseMode
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.memory import MemoryStorage, StorageKey
 from functools import wraps
 from aiogram.types import ChatMemberAdministrator, ChatMemberOwner
 import translations_2
@@ -44,7 +44,7 @@ from bybit_api import get_market_data
 # Добавьте этот импорт к остальным из translations_2
 from translations_2 import PROMPT_MARKET_KIT_RU, PROMPT_TF_KIT
 import pandas as pd
-from bybit_api import get_market_data, plot_chart, calculate_advanced_metrics, get_stock_data, aggregate_kline, load_coins_list, BASE_URL, get_coin_id
+from bybit_api import get_market_data, plot_chart_v4, calculate_advanced_metrics, get_stock_data, aggregate_kline, load_coins_list, BASE_URL, get_coin_id, get_bybit_symbols
 import re
 import aiogram.exceptions as aio_exc  # Добавь к imports (для TelegramNetworkError)
 import logging
@@ -55,6 +55,22 @@ import yfinance as yf
 from aiogram.client.default import DefaultBotProperties
 import os
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+import datetime as dt
+import json
+import json
+import re
+import ast
+import logging
+from typing import Optional, Dict, Any, List, Tuple
+# Вверху файла main_2_updated.py, рядом с другими импортами
+from io import BytesIO
+import traceback
+import time
+# Импортируем функции из bybit_api.py (путь — если модуль называется по-другому, поправь)
+from bybit_api import parse_llm_json_from_text, merge_metrics, normalize_kline_to_df
+from aiogram.types import BufferedInputFile
+
+
 
 # client = OpenAI(
 #     api_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjNmM2Y3M2UzLTJkYTItNDQzZC1iYWRkLWQ1YTcyMzA3YjhiNiIsImlzRGV2ZWxvcGVyIjp0cnVlLCJpYXQiOjE3NTA1Nzg3NzAsImV4cCI6MjA2NjE1NDc3MH0.gDY05uWtqB3DnJKlhbU36Lrahtd3JEcQGWnYfdgw0LM",
@@ -77,7 +93,8 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
 
-logging.basicConfig(level=logging.INFO)
+# logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, filename='bot.log', format='%(asctime)s - %(levelname)s - %(message)s')
 # ============================================
 # ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОТМЕНЫ - РАЗМЕСТИТЬ ЗДЕСЬ
 # ============================================
@@ -157,6 +174,27 @@ PRICES = {
 VIP_PREDICTION_PRICE = 5  # Первичная цена VIP-прогноза
 REGULAR_PREDICTION_PRICE = 2  # Первичная цена обычного прогноза
 
+# ───────────────────────────────────────────────────────────────────────────────
+
+def save_coins_list(coins_list):
+    try:
+        with open('coins.json', 'w') as f:
+            json.dump({'coins': coins_list}, f, indent=4)
+        logging.info("Coins list successfully updated in coins.json")
+    except IOError as e:
+        logging.error(f"Error saving coins list: {e}")
+
+async def schedule_coins_update():
+    while True:
+        now = dt.datetime.now(dt.timezone(dt.timedelta(hours=3)))  # UTC+3 (Moscow time)
+        next_midnight = (now + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        sleep_seconds = (next_midnight - now).total_seconds()
+        await asyncio.sleep(sleep_seconds)
+        try:
+            load_coins_list(force_update=True)  # Вызов из bybit_api.py
+            logging.info("coins.json успешно обновлен в 00:00 UTC+3")
+        except Exception as e:
+            logging.error(f"Ошибка обновления coins.json: {e}")
 # ───────────────────────────────────────────────────────────────────────────────
 async def polling_with_retry(dp: Dispatcher, bot: Bot, max_retries: int = 10):
     retries = 0
@@ -2526,6 +2564,7 @@ async def finish_user_promocode(callback: types.CallbackQuery, state: FSMContext
             await asyncio.sleep(1) # Небольшая задержка перед перенаправлением
             await process_profile_redirect(user_id)
 
+
 @router.callback_query(F.data == "close_trafer_panel")
 async def close_trafer_panel(callback: types.CallbackQuery):
     user_id = callback.from_user.id
@@ -2549,9 +2588,106 @@ async def back_admin(callback: types.CallbackQuery):
         return
     await callback.answer()
 
+
 # ===================================================================
 # FSM и хендлеры для РЫНОЧНОГО (Крипта/Акции) прогноза
 # ===================================================================
+def extract_json_block(s: str) -> Optional[Dict[str, Any]]:
+    """
+    Попытаться извлечь JSON/Python-dict из строки s.
+    Возвращает распарсенный dict или None.
+    Логика:
+      1) Найти ```json ... ``` блоки (case-insensitive).
+      2) Затем любые ``` ... ``` блоки.
+      3) Затем все {...} фрагменты.
+      4) Попытаться распарсить каждую кандидатуру через json.loads, fallback ast.literal_eval.
+      5) Выбрать объект с наибольшим количеством ожидаемых ключей (приоритет — forecast и т.д.)
+    """
+    if not s or not isinstance(s, str):
+        return None
+
+    candidates: List[str] = []
+
+    # 1) ```json ... ```
+    for m in re.finditer(r"```json\s*([\s\S]*?)```", s, flags=re.IGNORECASE):
+        candidates.append(m.group(1).strip())
+
+    # 2) любые ``` ... ```
+    # (включая ```JSON``` и просто ``` ... ```)
+    for m in re.finditer(r"```\s*([\s\S]*?)```", s):
+        cand = m.group(1).strip()
+        # если мы уже добавили тот же текст из step 1, не дублируем
+        if cand not in candidates:
+            candidates.append(cand)
+
+    # 3) все {...} фрагменты (не жадно)
+    for m in re.finditer(r"\{[\s\S]*?\}", s):
+        cand = m.group(0).strip()
+        if cand not in candidates:
+            candidates.append(cand)
+
+    # Если ничего не найдено по выше — вернуть None
+    if not candidates:
+        return None
+
+    parsed_candidates: List[Tuple[int, Dict[str, Any]]] = []
+    expected_keys = {
+        "forecast", "forecast_confidence", "backtest_probs",
+        "support_level", "resistance_level", "signals", "metrics_to_show"
+    }
+
+    def try_parse(text: str) -> Optional[Dict[str, Any]]:
+        # 1) try json.loads directly
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        # 2) try ast.literal_eval (handle Python dicts single quotes etc.)
+        try:
+            obj = ast.literal_eval(text)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        # 3) try to fix some common LLM issues: trailing commas -> remove them
+        try:
+            # remove trailing commas before } and ]
+            cleaned = re.sub(r",\s*([}\]])", r"\1", text)
+            obj = json.loads(cleaned)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        return None
+
+    for cand in candidates:
+        parsed = try_parse(cand)
+        if not parsed:
+            continue
+        # Score by how many expected keys present (prefer richer objects)
+        score = len(expected_keys.intersection(set(parsed.keys())))
+        parsed_candidates.append((score, parsed))
+
+    if not parsed_candidates:
+        return None
+
+    # choose candidate with max score; if tie — first encountered with that score
+    parsed_candidates.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_obj = parsed_candidates[0]
+    # if best_score == 0, still may be a valid dict without our keys; return it (but log)
+    if best_score == 0:
+        logging.debug("extract_json_block: parsed JSON found but no expected keys; returning it anyway.")
+    return best_obj
+
+
+# Глобальный кэш (dict) для market_data: ключ "ticker:tf:prog_type"
+market_cache = {}  # { "BTC:1d:ob": market_data, ... }
+CACHE_TTL = 300  # 5 мин
+
+# Глобальный флаг для пользователей в режиме поиска крипты
+user_search_flags = {}  # {user_id: {'in_crypto_search': True}}
 
 # Вставьте этот словарь в начало блока FSM для рыночного прогноза (перед class MarketPrognozState)
 tf_to_code = {
@@ -2559,18 +2695,57 @@ tf_to_code = {
     "1 час": "1h",
     "1 день": "1d",
     "1 неделя": "1w",
-    "1 месяц": "1m",
-    "Полгода": "6m",
-    "1 год": "1y"
+    "1 месяц": "1M",    # Используем '1M' (Month) для однозначности
+    "Полгода": "6M",    # Используем '6M'
+    "1 год": "1Y"       # Используем '1Y' (Year)
 }
 
+
 class MarketPrognozState(StatesGroup):
-    asset_type = State()    # 'crypto' или 'stock'
-    asset_name = State()    # Тикер (BTC, AAPL и т.д.)
-    network = State()       # Новая: сеть для крипты (USDT, USD, BTC, Spot)
-    timeframe = State()     # '5 мин', '1 час', '1 день', '1 неделя', '1 месяц', 'Полгода', '1 год'
-    confirm = State()       # Подтверждение данных
-    prog_type = State()     # 'ob' или 'rach' (обычный или VIP)
+    asset_type = State()  # 'crypto' или 'stock'
+    asset_name = State()  # Тикер (BTC, AAPL и т.д.)
+    timeframe = State()  # '5 мин', '1 час', '1 день', '1 неделя', '1 месяц', 'Полгода', '1 год'
+    confirm = State()  # Подтверждение данных
+    prog_type = State()  # 'ob' или 'rach' (обычный или VIP)
+
+
+# Inline handler:
+@router.inline_query()
+async def inline_ticker_search(inline_query: types.InlineQuery):
+    user_id = inline_query.from_user.id
+    logging.info(f"Inline query: user={user_id}, query='{inline_query.query}', chat_type={inline_query.chat_type}")
+
+    if inline_query.chat_type not in ['private', 'sender', None] or not user_search_flags.get(user_id, {}).get('in_crypto_search', False):
+        logging.info("Ignored: wrong chat_type or not in search mode")
+        await inline_query.answer([])  # Игнорируем
+        return
+
+    query = inline_query.query.strip().lower()
+    if not query:
+        logging.info("Ignored: empty query")
+        await inline_query.answer([])  # Нет запроса
+        return
+
+    # Поиск по contains в name без 'USDT Perpetual' или symbol
+    matches = [coin for coin in coins_data if query in coin['name'].lower().replace(' usdt perpetual', '') or query in coin['symbol'].lower()]
+    logging.info(f"Matches found: {len(matches)} for query '{query}'")
+
+    results = []
+    for i, coin in enumerate(matches[:50]):
+        ticker = coin['symbol']  # Полный 'BTCUSDT'
+        title = coin['name']
+        description = f"Symbol: {ticker}"
+        results.append(types.InlineQueryResultArticle(
+            id=str(i),
+            title=title,
+            description=description,
+            input_message_content=types.InputTextMessageContent(message_text=ticker),
+            # reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[
+            #     types.InlineKeyboardButton(text="Выбрать", callback_data=f"select_ticker:{ticker}")
+            # ]])
+        ))
+
+    await inline_query.answer(results, cache_time=1, is_personal=True)
 
 # --- Запуск FSM ---
 @router.callback_query(F.data.in_({'new_ob_prognoz', 'new_rach_prognoz'}))
@@ -2596,112 +2771,112 @@ async def market_prognoz_start(cb: types.CallbackQuery, state: FSMContext):
     # Шаг 1: Выбор типа актива
     markup = types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="🪙 Криптовалюта", callback_data="asset_crypto")],
-        [types.InlineKeyboardButton(text="📈 Акция", callback_data="asset_stock")]
+        [types.InlineKeyboardButton(text="📈 Акция", callback_data="asset_stock")],
+        [types.InlineKeyboardButton(text="🖼️ NFT", callback_data="asset_nft")]
     ])
     msg = await cb.message.answer("Выберите тип актива для анализа:", reply_markup=markup)
     await add_fsm_message_id(state, msg.message_id)
     await state.set_state(MarketPrognozState.asset_type)
 
-# --- Шаг 2: Получение типа и запрос названия ---
+
+# --- Шаг 2: Получение типа и запрос названия (с кнопкой для inline) ---
 @router.callback_query(StateFilter(MarketPrognozState.asset_type), F.data.startswith("asset_"))
 async def asset_type_step(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    asset_type = cb.data.split("_")[1]  # 'crypto' or 'stock'
+    asset_type = cb.data.split("_")[1]
     await state.update_data(asset_type=asset_type)
 
-    prompt_text = "Введите тикер криптовалюты (например, BTC, ETH, SOL):" if asset_type == 'crypto' else "Введите тикер акции (например, AAPL, GOOGL, TSLA):"
+    lang = await get_user_lang(cb.from_user.id) or 'ru'
 
-    msg = await cb.message.edit_text(prompt_text)  # Редактируем прошлое сообщение
-    await state.set_state(MarketPrognozState.asset_name)
+    if asset_type in ['nft', 'stock']:
+        msg = await cb.message.answer(translations_2.translations[lang]['in_development'])
+        await asyncio.sleep(3)
+        await bot.delete_message(cb.message.chat.id, msg.message_id)
+        await state.clear()
+        return
 
-# --- Шаг 3: Получение названия и проверка/выбор сети (для крипты) или timeframe (для stocks) ---
+    if asset_type == 'crypto':
+        # Set flag
+        user_id = cb.from_user.id
+        user_search_flags[user_id] = {'in_crypto_search': True}
+        logging.info(f"Set search flag for user {user_id}")
+
+        prompt_text = "Введите тикер криптовалюты (например, BTC, ETH, SOL).\nДля динамического поиска нажмите кнопку ниже — поле ввода заполнится автоматически!"
+        markup = types.InlineKeyboardMarkup(inline_keyboard=[[
+            types.InlineKeyboardButton(
+                text="🔍 Начать поиск",
+                switch_inline_query_current_chat=""
+            )
+        ]])
+        msg = await cb.message.edit_text(prompt_text, reply_markup=markup)
+        await state.set_state(MarketPrognozState.asset_name)
+
+
+# --- Шаг 3: Получение названия с поиском (fallback для текста) ---
 @router.message(StateFilter(MarketPrognozState.asset_name), F.text)
 async def asset_name_step(msg: types.Message, state: FSMContext):
     await add_fsm_message_id(state, msg.message_id)
-    asset_name = msg.text.strip().upper()
+    query = msg.text.strip().lower()
     data = await state.get_data()
     asset_type = data['asset_type']
 
     if asset_type == 'crypto':
-        # Проверяем существование крипты через CoinGecko
-        coin_id = get_coin_id(asset_name)
-        if not coin_id:
-            await msg.answer("❌ Криптовалюта не найдена. Попробуйте другой тикер (e.g., BTC, ETH, SOL) или введите правильно.")
-            return  # Остаемся в state asset_name
+        matches = [coin for coin in coins_data if
+                   query in coin['name'].lower().replace(' usdt perpetual', '') or query in coin['symbol'].lower()]
+        if not matches:
+            out = await msg.answer(
+                "❌ Не найдено. Попробуйте ввести другой тикер (e.g., BTC) или используйте поисковую кнопку выше.")
+            await add_fsm_message_id(state, out.message_id)
+            return
 
-        # Получаем доступные сети (pairs) с Bybit
-        try:
-            available_networks = []
-            available_categories = {}
-            session = httpx.Client()
-            for category in ['linear', 'inverse', 'spot']:
-                params = {"category": category}
-                response = session.get(f"{BASE_URL}/v5/market/tickers", params=params).json()
-                tickers = response.get('result', {}).get('list', [])
-                for ticker in tickers:
-                    if ticker['symbol'].startswith(asset_name) and ticker['symbol'] != asset_name:  # e.g., SOLUSDT, SOLUSD
-                        network = ticker['symbol'][len(asset_name):]  # USDT, USD, etc.
-                        if any(char.isdigit() for char in network): continue  # Skip dated
-                        if network in ['USDT', 'USDC', 'USD', 'BTC', 'ETH', 'TRY', 'FDUSD']:
-                            # Check if kline available (limit=1)
-                            test_params = {"category": category, "symbol": ticker['symbol'], "interval": "D", "limit": 1}
-                            test_response = session.get(f"{BASE_URL}/v5/market/kline", params=test_params).json()
-                            if test_response.get("retCode") == 0 and test_response["result"]["list"]:
-                                available_networks.append(network)
-                                available_categories[network] = category
+        # Если matches >0, proceed с первым (для inline или manual)
+        if matches:
+            ticker = matches[0]['symbol']  # Полный 'BTCUSDT'
+            await state.update_data(asset_name=ticker)
+            # Clear flag
+            user_id = msg.from_user.id
+            user_search_flags.pop(user_id, None)
+            await proceed_to_timeframe(msg, state)
+            return
 
-            if not available_networks:
-                await msg.answer(f"❌ Нет доступных сетей с данными для торговли {asset_name}. Попробуйте другую крипту.")
-                return
-
-            await state.update_data(asset_name=asset_name, available_networks=available_networks, available_categories=available_categories)
-            markup = types.InlineKeyboardMarkup(inline_keyboard=[])
-            row = []
-            for net in available_networks:
-                row.append(types.InlineKeyboardButton(text=net, callback_data=f"network_{net}"))
-                if len(row) == 2:
-                    markup.inline_keyboard.append(row)
-                    row = []
-            if row:
-                markup.inline_keyboard.append(row)
-            await msg.answer(f"Выберите сеть для торговли {asset_name}:", reply_markup=markup)
-            await state.set_state(MarketPrognozState.network)
-        except Exception as e:
-            logging.error(f"Ошибка проверки сетей: {e}")
-            await msg.answer("❌ Ошибка при проверке сетей. Попробуйте позже.")
-            await state.clear()
-    else:  # stock
-        await state.update_data(asset_name=asset_name)
-        # Переходим сразу к timeframe
-        markup = types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="5 мин", callback_data="tf_5min"),
-             types.InlineKeyboardButton(text="1 час", callback_data="tf_1h")],
-            [types.InlineKeyboardButton(text="1 день", callback_data="tf_1d"),
-             types.InlineKeyboardButton(text="1 неделя", callback_data="tf_1w")],
-            [types.InlineKeyboardButton(text="1 месяц", callback_data="tf_1m"),
-             types.InlineKeyboardButton(text="Полгода", callback_data="tf_6m")],
-            [types.InlineKeyboardButton(text="1 год", callback_data="tf_1y")]
-        ])
-        out = await msg.answer("Выберите горизонт прогноза:", reply_markup=markup)
+        # Fallback (редко)
+        buttons = []
+        for coin in matches[:10]:
+            ticker = coin['symbol']
+            buttons.append([types.InlineKeyboardButton(text=coin['name'], callback_data=f"select_ticker:{ticker}")])
+        markup = types.InlineKeyboardMarkup(inline_keyboard=buttons)
+        out = await msg.answer(f"Найдено {len(matches)} совпадений. Выберите:", reply_markup=markup)
         await add_fsm_message_id(state, out.message_id)
-        await state.set_state(MarketPrognozState.timeframe)
 
-# --- Новый шаг: Выбор сети для крипты (inline) ---
-@router.callback_query(StateFilter(MarketPrognozState.network), F.data.startswith("network_"))
-async def network_inline_step(cb: types.CallbackQuery, state: FSMContext):
-    await cb.answer()
-    network = cb.data.split("_")[1].upper()
-    data = await state.get_data()
-    available_networks = data.get('available_networks', [])
+    else:
+        # stock без изменений
+        try:
+            info = yf.Ticker(query.upper()).info
+            if not info or 'regularMarketPrice' not in info:
+                raise ValueError("Invalid stock")
+            await state.update_data(asset_name=query.upper())
+            await proceed_to_timeframe(msg, state)
+        except:
+            out = await msg.answer("❌ Акция не найдена. Попробуйте другой тикер (e.g., AAPL).")
+            await add_fsm_message_id(state, out.message_id)
+            return
 
-    if network not in available_networks:
-        await cb.message.edit_text(f"❌ {network} не доступна. Выберите из кнопок.")
-        return
 
-    category = data.get('available_categories', {}).get(network, 'linear')
-    await state.update_data(network=network, category=category)
+# Callback для выбора из поиска
+@router.callback_query(StateFilter(MarketPrognozState.asset_name), F.data.startswith("select_ticker:"))
+async def select_ticker(cb: types.CallbackQuery, state: FSMContext):
+    ticker = cb.data.split(":")[1]
+    await state.update_data(asset_name=ticker)
+    await cb.answer(f"Выбрано: {ticker}")
+    await cb.message.delete()  # Удаляем сообщение с кнопками
+    # Clear flag
+    user_id = cb.from_user.id
+    user_search_flags.pop(user_id, None)
+    await proceed_to_timeframe(cb.message, state)  # msg → cb.message
 
-    # Proceed to timeframe
+
+# Вспомогательная функция для перехода к timeframe
+async def proceed_to_timeframe(msg_or_cb_msg: types.Message, state: FSMContext):
     markup = types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="5 мин", callback_data="tf_5min"),
          types.InlineKeyboardButton(text="1 час", callback_data="tf_1h")],
@@ -2711,8 +2886,10 @@ async def network_inline_step(cb: types.CallbackQuery, state: FSMContext):
          types.InlineKeyboardButton(text="Полгода", callback_data="tf_6m")],
         [types.InlineKeyboardButton(text="1 год", callback_data="tf_1y")]
     ])
-    await cb.message.edit_text("Выберите горизонт прогноза:", reply_markup=markup)
+    out = await msg_or_cb_msg.answer("Выберите горизонт прогноза:", reply_markup=markup)
+    await add_fsm_message_id(state, out.message_id)
     await state.set_state(MarketPrognozState.timeframe)
+
 
 # --- Шаг 4: Получение срока и подтверждение ---
 @router.callback_query(StateFilter(MarketPrognozState.timeframe), F.data.startswith("tf_"))
@@ -2734,7 +2911,6 @@ async def timeframe_step(cb: types.CallbackQuery, state: FSMContext):
         f"📋 Проверьте данные:\n"
         f"Тип: {asset_type_map.get(data['asset_type'])}\n"
         f"Актив: {data['asset_name']}\n"
-        f"Сеть: {data.get('network', 'N/A')}\n"  # Добавляем сеть, если есть
         f"Срок: {data['timeframe']}"
     )
 
@@ -2747,6 +2923,7 @@ async def timeframe_step(cb: types.CallbackQuery, state: FSMContext):
     await cb.message.edit_text(summary, reply_markup=markup)
     await state.set_state(MarketPrognozState.confirm)
 
+
 # --- Перезапуск FSM ---
 @router.callback_query(F.data == 'restart_market_prognoz', StateFilter(MarketPrognozState.confirm))
 async def restart_market_prognoz(cb: types.CallbackQuery, state: FSMContext):
@@ -2755,28 +2932,109 @@ async def restart_market_prognoz(cb: types.CallbackQuery, state: FSMContext):
     cb.data = 'new_ob_prognoz' if data.get('prog_type') == 'ob' else 'new_rach_prognoz'
     await market_prognoz_start(cb, state)
 
+
+# --- Подтверждение и генерация с обработкой ошибок ---
 @router.callback_query(F.data == 'confirm_market_prognoz', StateFilter(MarketPrognozState.confirm))
 async def confirm_market_prognoz(cb: types.CallbackQuery, state: FSMContext):
     user_id = cb.from_user.id
     lang = await get_user_lang(user_id)
-
-    await cb.message.edit_text("⏳ Собираю и анализирую рыночные данные... Это может занять до 30 секунд.")
-    await cb.answer()
+    processing_message = await cb.message.edit_text(
+        "⏳ Собираю и анализирую рыночные данные... Это может занять до 30 секунд.")
 
     data = await state.get_data()
     prog_type = data['prog_type']
+    asset_name = data['asset_name']
+    timeframe_code = data['timeframe_code']
+    asset_type = data['asset_type']
+    is_vip = (prog_type != 'ob')
 
-    # --- Списание прогнозов ---
+    # Clear flag on confirm (на всякий)
+    user_search_flags.pop(user_id, None)
+
+    # Получаем данные
+    if asset_type == 'stock':
+        # Для акций, возможно, стоит использовать другой лимит или функцию, если она отличается
+        limit = 365  # Пример, можно настроить
+        market_data = await get_stock_data(asset_name, interval=timeframe_code, limit=limit)
+    else:
+        # Для крипто используем get_market_data, который внутри вызывает get_kline_data
+        # Лимиты можно регулировать, но 500 для 5m/1h, 365 для 1d/1w, 120 для 1m, 240 для 6m/1y выглядят разумно.
+        # limit = 500 if timeframe_code in ['5m', '1h'] else 365 if timeframe_code in ['1d',
+        #                                                                              '1w'] else 120 if timeframe_code == '1m' else 240
+        tf = timeframe_code.lower()
+        limit = 500 if tf in ['5m', '1h'] else 365 if tf in ['1d', '1w'] else 120 if tf == '1m' else 240
+        market_data = await get_market_data(asset_name, timeframe=timeframe_code, limit=limit, is_vip=is_vip)
+
+    # --- Усиленная проверка полученных данных ---
+    # Проверяем, что данные получены, что есть список kline_data,
+    # что он не пустой, и что есть хотя бы 2 свечи для анализа.
+    # Также проверяем наличие ключевых индикаторов, которые мы передаем в LLM.
+    # --- Надёжная проверка полученных данных ---
+    # Проверяем, что market_data есть и в нём есть kline_data
+    if market_data is None:
+        logging.warning(f"Incomplete market_data (None) for {asset_name} on {timeframe_code}")
+        await cb.message.edit_text("❌ Ошибка: не удалось получить рыночные данные. Попробуйте позже.")
+        await state.set_state(MarketPrognozState.asset_name)
+        await cb.message.answer("Введите тикер заново:")
+        return
+
+    kline_raw = market_data.get('kline_data', None)
+    # нормализуем определение длины: dataframe -> len(df), list -> len(list)
+    if kline_raw is None:
+        logging.warning(f"No kline_data for {asset_name} on {timeframe_code}. market_data keys: {list(market_data.keys())}")
+        await cb.message.edit_text("❌ Ошибка: не найдены исторические свечи для этого тикера/таймфрейма.")
+        await state.set_state(MarketPrognozState.asset_name)
+        await cb.message.answer("Введите тикер заново:")
+        return
+
+    # compute kline_len robustly
+    try:
+        if isinstance(kline_raw, pd.DataFrame):
+            kline_len = len(kline_raw)
+        else:
+            # try to treat as iterable (list of lists/dicts)
+            kline_len = len(kline_raw)
+    except Exception:
+        kline_len = 0
+
+    # Проверяем наличие требуемых ключей в market_data (без преобразования DataFrame в bool)
+    required_keys = ['atr', 'rsi', 'bollinger_high', 'support_level', 'onchain', 'macro']
+    missing_keys = [k for k in required_keys if k not in market_data]
+    if kline_len < 2 or missing_keys:
+        logging.warning(f"Incomplete or insufficient market data for {asset_name} on {timeframe_code}. kline_len={kline_len}, missing_keys={missing_keys}")
+        err_msg = "❌ Ошибка: не удалось получить полные рыночные данные. Попробуйте другой тикер или таймфрейм."
+        await cb.message.edit_text(err_msg)
+        await state.set_state(MarketPrognozState.asset_name)
+        await cb.message.answer("Введите тикер заново:")
+        return
+
+    elif kline_len < 14:  # Предупреждение, но продолжаем, если есть другие данные
+        logging.warning(f"Limited data ({kline_len} candles) for plotting. Chart might be basic.")
+        # Можно решить, продолжать ли здесь или вернуть ошибку, если полный график критичен
+        # Если вы хотите, чтобы график строился только при достаточном количестве свечей:
+        # error_text = "❌ Ошибка: Недостаточно исторических данных для построения качественного графика."
+        # await cb.message.edit_text(error_text)
+        # await state.set_state(MarketPrognozState.asset_name)
+        # await cb.message.answer("Введите тикер заново:")
+        # return
+
+    # --- Если все проверки пройдены, продолжаем ---
+    # Данные OK — теперь списываем
     user = await get_user(user_id)
     ob_cnt, rach_cnt, ob_vr, rach_vr = user[4], user[5], user[6], user[7]
+
+    # --- Блок списания средств (оставлен без изменений, но перенесен выше для логичности) ---
     if prog_type == 'ob':
         if ob_vr <= 0 and ob_cnt <= 0:
             await bot.send_message(user_id, translations_2.translations[lang]['NOT_od_prognoz'])
+            await state.clear()
             return await process_profile_redirect(user_id)
-    else:
+    else:  # VIP
         if rach_vr <= 0 and rach_cnt <= 0:
             await bot.send_message(user_id, translations_2.translations[lang]['NOT_VIP_prognoz'])
+            await state.clear()
             return await process_profile_redirect(user_id)
+
     async with aiosqlite.connect('users.db') as udb:
         if prog_type == 'ob':
             await udb.execute(
@@ -2787,6 +3045,7 @@ async def confirm_market_prognoz(cb: types.CallbackQuery, state: FSMContext):
                 "UPDATE users SET rach_vr_prognoz = rach_vr_prognoz - 1 WHERE id = ?" if rach_vr > 0 else "UPDATE users SET rach_prognoz = rach_prognoz - 1 WHERE id = ?",
                 (user_id,))
         await udb.commit()
+
     forecast_type = 'forecast_ob' if prog_type == 'ob' else 'forecast_vip'
     usage_type = 'usage_ob' if prog_type == 'ob' else 'usage_vip'
     async with aiosqlite.connect('payments.db') as pdb:
@@ -2797,53 +3056,20 @@ async def confirm_market_prognoz(cb: types.CallbackQuery, state: FSMContext):
         await pdb.commit()
 
     try:
-        # 1. Получаем РАСШИРЕННЫЕ данные с помощью обновленной функции
-        asset_name = data['asset_name']
-        timeframe_code = data['timeframe_code']
-        network = data.get('network', '')  # Для крипты, если есть
+        # --- Формирование промпта и генерация прогноза ---
+        # 1. Форматируем ВСЕ данные для промпта (расширили для новых полей)
+        # Добавим более безопасные .get() для всех вложенных словарей
+        onchain_data = market_data.get('onchain', {})
+        macro_data = market_data.get('macro', {})
+        backtest_probs_data = market_data.get('backtest_probs', {})
+        netflow = onchain_data.get('netflow', {})
+        sopr = onchain_data.get('sopr', {})
+        mvrv = onchain_data.get('mvrv', {})
+        puell = onchain_data.get('puell', {})
 
-        # Динамический limit для TF (меньше для длинных, чтобы избежать ошибок API)
-        if timeframe_code in ['5m', '1h']:
-            limit = 500
-        elif timeframe_code in ['1d', '1w']:
-            limit = 365  # 1 год дней или ~7 лет недель
-        elif timeframe_code in ['1m']:
-            limit = 120  # 10 лет месяцев
-        else:  # '6m', '1y'
-            limit = 240  # 20 лет месяцев для аггрегации
-
-        is_vip = (prog_type != 'ob')  # True для VIP, False для обычного - идеально подходит под логику
-
-        if data['asset_type'] == 'stock':
-            market_data = await get_stock_data(asset_name, interval=timeframe_code, limit=limit)
-            logging.info(f"Market data for {asset_name}: {market_data}")  # Для просмотра в консоли full data
-            if market_data is None:
-                await cb.message.edit_text(
-                    "❌ Монета не найдена. Попробуйте другой тикер (e.g., BTCUSDT, ETHUSDT) или напишите по-другому.")
-                await state.clear()
-                return
-        else:
-            # Для крипты: формируем full symbol = asset_name + network
-            full_symbol = asset_name + network
-            category = data.get('category', 'linear')
-            market_data = await get_market_data(full_symbol, timeframe_code, limit=limit, is_vip=is_vip, category=category)  # Добавили category
-            logging.info(f"Market data for {full_symbol}: {market_data}")  # Для просмотра в консоли
-            if not market_data or not market_data.get('kline_data'):
-                await cb.message.edit_text(f"❌ No historical data for {full_symbol} on this timeframe. Try another network or shorter TF.")
-                await state.clear()
-                return
-
-        if not market_data or "atr" not in market_data or len(market_data['kline_data']) == 0:
-            logging.error(f"No data or empty kline for {asset_name}")
-            error_text = f"❌ Не удалось получить полные данные для актива {asset_name}. Возможно, тикер указан неверно или актив неликвиден. Попробуйте другой."
-            await cb.message.edit_text(error_text)
-            await state.clear()
-            return
-
-        # 2. Форматируем ВСЕ данные для промпта (расширили для новых полей)
         market_data_string = (
             f"- Asset: {market_data.get('symbol', 'N/A')}\n"
-            f"- Current Price: {market_data.get('current_price', 0)}\n"
+            f"- Current Price: ${market_data.get('current_price', 0):,.2f}\n"  # Форматируем цену
             f"- 24h Change: {market_data.get('price_change_24h_percent', 0):.2f}%\n"
             f"--- Technicals ---\n"
             f"- Trend (EMA20 vs EMA50): {market_data.get('trend_condition', 'N/A')}\n"
@@ -2853,35 +3079,36 @@ async def confirm_market_prognoz(cb: types.CallbackQuery, state: FSMContext):
             f"- Volatility (ATR % of Price): {market_data.get('volatility_percent', 0):.2f}%\n"
             f"- Bollinger High: {market_data.get('bollinger_high', 0):.2f}\n"
             f"- Bollinger Low: {market_data.get('bollinger_low', 0):.2f}\n"
-            f"- Support: {market_data.get('support_level', 0):.2f}\n"
-            f"- Resistance: {market_data.get('resistance_level', 0):.2f}\n"
+            f"- Support: ${market_data.get('support_level', 0):,.2f}\n"
+            f"- Resistance: ${market_data.get('resistance_level', 0):.2f}\n"
             f"- MACD Trend: {market_data.get('macd_trend', 'N/A')}\n"
-            f"- VWAP: {market_data.get('vwap', 0):.2f}\n"
+            f"- VWAP: ${market_data.get('vwap', 0):,.2f}\n"
             f"--- Derivatives ---\n"
             f"- Open Interest: ${market_data.get('open_interest_value', 0):,.0f}\n"
             f"- Funding Rate: {market_data.get('funding_rate', 0):.4f}%\n"
             f"--- On-Chain ---\n"
-            f"- Netflow: {market_data['onchain']['netflow'].get('value', 0):,.0f} ({market_data['onchain']['netflow'].get('interpretation', 'N/A')})\n"
-            f"- LTH SOPR: {market_data['onchain']['sopr'].get('value', 0):.3f} ({market_data['onchain']['sopr'].get('interpretation', 'N/A')})\n"
-            f"- MVRV: {market_data['onchain']['mvrv'].get('value', 0):.3f} ({market_data['onchain']['mvrv'].get('interpretation', 'N/A')})\n"
-            f"- Puell: {market_data['onchain']['puell'].get('value', 0):.3f} ({market_data['onchain']['puell'].get('interpretation', 'N/A')})\n"
+            f"- Netflow: {netflow.get('value', 0):,.0f} ({netflow.get('interpretation', 'N/A')})\n"
+            f"- LTH SOPR: {sopr.get('value', 1.0):.3f} ({sopr.get('interpretation', 'N/A')})\n"
+            f"- MVRV: {mvrv.get('value', 0):.3f} ({mvrv.get('interpretation', 'N/A')})\n"
+            f"- Puell: {puell.get('value', 0):.3f} ({puell.get('interpretation', 'N/A')})\n"
             f"--- Macro ---\n"
-            f"- S&P Corr: {market_data['macro'].get('sp500_corr', 0):.2f}\n"
-            f"- ETF Inflows: {market_data['macro'].get('etf_inflows', 0):,.0f}\n"
+            f"- S&P Corr: {macro_data.get('sp500_corr', 0):.2f}\n"
+            f"- ETF Inflows: ${macro_data.get('etf_inflows', 0):,.0f}\n"
             f"--- Backtest Probs ---\n"
-            f"- Up: {market_data['backtest_probs'].get('up', 50)}%\n"
-            f"- Base: {market_data['backtest_probs'].get('base', 30)}%\n"
-            f"- Down: {market_data['backtest_probs'].get('down', 20)}%"
+            f"- Up: {backtest_probs_data.get('up', 50)}%\n"
+            f"- Base: {backtest_probs_data.get('base', 30)}%\n"
+            f"- Down: {backtest_probs_data.get('down', 20)}%"
         )
 
-        # 3. Выбираем нужный промпт
+        # 2. Выбираем нужный промпт
+        # ... (логика выбора kit и prompt_task остается без изменений) ...
         timeframe_code = data['timeframe_code']
         kit_key = 'REGULAR' if prog_type == 'ob' else 'VIP'
         kit = PROMPT_TF_KIT['ru'][timeframe_code][kit_key]
         system_role = kit['ROLE']
         prompt_task = kit['TASK']
 
-        # Дополнительные параметры для промптов (расширили для новых данных)
+        # Дополнительные параметры для промптов
         funding_rate = market_data.get('funding_rate', 0)
         params = {
             'symbol': market_data.get('symbol', 'N/A'),
@@ -2893,7 +3120,8 @@ async def confirm_market_prognoz(cb: types.CallbackQuery, state: FSMContext):
             'ema_50': market_data.get('ema_50', 0),
             'vwap': market_data.get('vwap', 0),
             'rsi': market_data.get('rsi', 50),
-            'rsi_zone': 'overbought' if market_data.get('rsi', 50) > 70 else 'oversold' if market_data.get('rsi', 50) < 30 else 'neutral',
+            'rsi_zone': 'overbought' if market_data.get('rsi', 50) > 70 else 'oversold' if market_data.get('rsi',
+                                                                                                           50) < 30 else 'neutral',
             'trend_condition': market_data.get('trend_condition', 'N/A'),
             'macd_trend': market_data.get('macd_trend', 'N/A'),
             'funding_rate': funding_rate,
@@ -2902,26 +3130,24 @@ async def confirm_market_prognoz(cb: types.CallbackQuery, state: FSMContext):
             'support_level': market_data.get('support_level', 0),
             'resistance_level': market_data.get('resistance_level', 0),
             'market_data_string': market_data_string,
-            # Ручные интерпретации
             'bias': 'бычий' if funding_rate > 0 else 'медвежий' if funding_rate < 0 else 'нейтральный',
-            'interpret': market_data['onchain']['netflow'].get('interpretation', 'N/A'),
-            # On-chain
-            'netflow_interpretation': market_data['onchain']['netflow'].get('interpretation', 'N/A'),
-            'sopr_value': market_data['onchain']['sopr'].get('value', 1.0),
-            'sopr_interpretation': market_data['onchain']['sopr'].get('interpretation', 'N/A'),
-            'mvrv_value': market_data['onchain']['mvrv'].get('value', 0),
-            'mvrv_interpretation': market_data['onchain']['mvrv'].get('interpretation', 'N/A'),
-            'puell_value': market_data['onchain']['puell'].get('value', 0),
-            'puell_interpretation': market_data['onchain']['puell'].get('interpretation', 'N/A'),
-            # Macro
-            'sp500_corr': market_data['macro'].get('sp500_corr', 0),
-            'etf_inflows': market_data['macro'].get('etf_inflows', 0),
-            # Probs
-            'prob_up': market_data['backtest_probs'].get('up', 50),
-            'prob_base': market_data['backtest_probs'].get('base', 30),
-            'prob_down': market_data['backtest_probs'].get('down', 20),
+            'interpret': netflow.get('interpretation', 'N/A'),
+            'netflow_interpretation': netflow.get('interpretation', 'N/A'),
+            'sopr_value': sopr.get('value', 1.0),
+            'sopr_interpretation': sopr.get('interpretation', 'N/A'),
+            'mvrv_value': mvrv.get('value', 0),
+            'mvrv_interpretation': mvrv.get('interpretation', 'N/A'),
+            'puell_value': puell.get('value', 0),
+            'puell_interpretation': puell.get('interpretation', 'N/A'),
+            'sp500_corr': macro_data.get('sp500_corr', 0),
+            'etf_inflows': macro_data.get('etf_inflows', 0),
+            'prob_up': backtest_probs_data.get('up', 50),
+            'prob_base': backtest_probs_data.get('base', 30),
+            'prob_down': backtest_probs_data.get('down', 20),
             # R/R example calc (simple)
-            'rr_ratio': round((market_data.get('resistance_level', 0) - market_data.get('current_price', 0)) / (market_data.get('current_price', 0) - market_data.get('support_level', 0)), 1) if market_data.get('current_price', 0) > market_data.get('support_level', 0) else 1
+            'rr_ratio': round((market_data.get('resistance_level', 0) - market_data.get('current_price', 0)) / (
+                        market_data.get('current_price', 0) - market_data.get('support_level', 0)),
+                              1) if market_data.get('current_price', 0) > market_data.get('support_level', 0) else 1
         }
 
         final_task = prompt_task.format(**params)
@@ -2929,38 +3155,282 @@ async def confirm_market_prognoz(cb: types.CallbackQuery, state: FSMContext):
         messages = [
             {"role": "system", "content": system_role},
             {"role": "system", "content": PROMPT_MARKET_KIT_RU["INSTRUCTIONS"]},
-            {"role": "user", "content": final_task}
+            {"role": "user", "content": final_task},
+            {"role": "system", "content":
+                (
+                    "ВАЖНО: НЕ УДАЛЯЙТЕ и НЕ МЕНЯЙТЕ основной аналитический текст вашего ответа. "
+                    "В КОНЦЕ ВАШЕГО ОТВЕТА (после обычного человеческого объяснения) ОБЯЗАТЕЛЬНО приложите "
+                    "машинно-читаемый JSON в тройных обратных кавычках ```JSON ... ``` (только JSON внутри). "
+                    "JSON ДОЛЖЕН СОДЕРЖАТЬ ВСЕ ЧИСЛОВЫЕ ДАННЫЕ, НЕОБХОДИМЫЕ ДЛЯ ВИЗУАЛИЗАЦИИ.\n\n"
+                    "Требования к JSON (строго, пример ниже):\n"
+                    "1) Поле `forecast` — предпочтительно type='ohlcv' с массивом строк [timestamp_ms, open, high, low, close, volume].\n"
+                    "   Если LLM не может дать OHLCV, можно вернуть close-series: [[ts_ms, close], ...] с type='close_series'.\n"
+                    "2) Поле `trade_idea` — торговая идея для Action-карточки: type (LONG|SHORT), entry_price, take_profit_price, stop_loss_price, explain_short (1-2 предложения), signals (список строк).\n"
+                    "3) Поле `metrics_to_show` — список строк: какие карточки/метрики показывать справа (например [\"backtest_probs\",\"rsi\",\"macd\",\"vwap\",\"atr\"]).\n"
+                    "4) Поле `vip_metrics` — объект с деталями по каждой метрике: пример:\n"
+                    "   \"vip_metrics\": {\"backtest_probs\": {\"value\": 0.64, \"series\": [[ts_ms, val], ...]},\n"
+                    "                   \"rsi\": {\"value\": 42.3, \"series\": [[ts_ms, val], ...]},\n"
+                    "                   \"macd\": {\"line\": [[ts_ms,val],...], \"signal\": [[ts_ms,val],...]}}\n"
+                    "5) Поле `support_resistance_levels`: массив объектов {\"price\": number, \"type\": \"support\"|\"resistance\", \"strength\": number}.\n"
+                    "6) Поле `fibonacci_levels`: массив объектов {\"level\": \"0.382\", \"price\": number}.\n"
+                    "7) Поле `confidence` (опционально): {\"lower\": [[ts,price],...], \"upper\": [[ts,price],...]} — cone для визуализации.\n"
+                    "8) Поле `forecast_horizon`: {\"label\":\"5m\",\"ms\":300000} — обязательное для понимания хорджа (в миллисекундах).\n"
+                    "9) **Новое:** поле `x_axis`: укажите рекомендации для меток X на графике: \n"
+                    "   \"x_axis\": {\"hist_format\": \"%H:%M\", \"forecast_format\": \"%H:%M\", \"tick_interval\": {\"unit\":\"minutes|hours|days|weeks|months\",\"value\": 5}}.\n"
+                    "   Это позволит фронтенду/plotter корректно отрисовать будущие метки.\n\n"
+                    "Формат вложения: В конце обычного ответа поместите JSON в блоке:\n"
+                    "```JSON\n"
+                    "{\n"
+                    '  \"forecast\": {\"type\":\"ohlcv\",\"data\": [[<timestamp_ms>, <open>, <high>, <low>, <close>, <volume>], ...]},\n'
+                    '  \"trade_idea\": {\"type\":\"LONG\",\"entry_price\": 123.45,\"take_profit_price\":130.0,\"stop_loss_price\":119.4,\"explain_short\":\"Тезис...\",\"signals\":[\"EMA cross\",\"MACD+\",\"Winrate 68%\"]},\n'
+                    '  \"metrics_to_show\": [\"backtest_probs\",\"rsi\",\"macd\"],\n'
+                    '  \"vip_metrics\": {\"backtest_probs\":{\"value\":0.64,\"series\":[[ts,val],...]},\"rsi\":{\"value\":42.3,\"series\":[[ts,val],...]}},\n'
+                    '  \"support_resistance_levels\": [{\"price\":121.0,\"type\":\"support\",\"strength\":3}],\n'
+                    '  \"fibonacci_levels\": [{\"level\":\"0.382\",\"price\":118.6}],\n'
+                    '  \"confidence\": {\"lower\":[[ts,val],...],\"upper\":[[ts,val],...]},\n'
+                    '  \"x_axis\": {\"hist_format\":\"%H:%M\",\"forecast_format\":\"%H:%M\",\"tick_interval\":{\"unit\":\"minutes\",\"value\":5}},\n'
+                    '  \"forecast_horizon\": {\"label\":\"5m\",\"ms\":300000}\n'
+                    "}\n"
+                    "```\n\n"
+                    "Пояснения к именам метрик: используйте имена, совместимые с серверными вычислениями: "
+                    "\"rsi\", \"ema_20\", \"ema_50\", \"macd_line\", \"signal_line\", \"vwap\", \"atr\", \"volatility_percent\", "
+                    "\"backtest_probs\", \"fundamental_sentiment\", \"open_interest\", \"funding_rate\". Если вы добавляете новые метрики — укажите их имена.\n\n"
+                    "ВАЖНО: JSON всегда в конце и отделён от основного текста. Если вы не можете посчитать какую-то метрику — положите поле с null или не включайте его; НЕ ломайте JSON.\n\n"
+                    "Наконец — коротко (1-2 предложения) в основном (человеческом) тексте дайте тезис/план; JSON — только для визуализации."
+                )
+             }
         ]
 
-        # 5. Выполняем запрос к LLM
+        # # 3. Выполняем запрос к LLM
+        # resp = client.chat.completions.create(
+        #     model="gemini-2.5-pro-preview",
+        #     messages=messages,
+        #     temperature=0.4
+        # )
+        #
+        # # full raw text from LLM (человеческая часть + JSON-блок)
+        # raw_llm = resp.choices[0].message.content
+        # # human-readable html/text to send to user (we remove JSON block from it)
+        # final_html_response = sanitize_telegram_html(re.sub(r"```json[\s\S]*?```", "", raw_llm, flags=re.IGNORECASE).strip())
+        #
+        # # ----- РЕКОМЕНДУЕМЫЙ ПУТЬ: используем render_forecast_and_plot из bybit_api.py -----
+        # try:
+        #     # render_forecast_and_plot сам парсит JSON, мёржит метрики и вызывает plot_chart
+        #     png_bytes = await render_forecast_and_plot(
+        #         symbol=asset_name,
+        #         timeframe=timeframe_code,
+        #         llm_response_text=raw_llm,
+        #         is_vip=is_vip,
+        #         save_path=None  # можно указать путь для сохранения файла при отладке
+        #     )
+        #
+        #     # Отправляем картинку (если есть)
+        #     if png_bytes:
+        #         bio = BytesIO(png_bytes)
+        #         bio.name = 'chart.png'
+        #         bio.seek(0)
+        #         await bot.send_photo(chat_id=user_id, photo=bio, parse_mode="HTML")
+        #     else:
+        #         logging.warning("render_forecast_and_plot вернул None или пустой результат. Отправляем только текст.")
+        #         await bot.send_message(user_id, "⚠️ Не удалось построить график. Ниже — текстовый анализ:")
+        #
+        # except Exception as e:
+        #     logging.error(f"Ошибка при render_forecast_and_plot: {e}\n{traceback.format_exc()}")
+        #     # fallback — просто отправляем текст
+        #     await bot.send_message(user_id, "⚠️ Не удалось автоматически сгенерировать график. Ниже — текстовый анализ:")
+        #
+        # # Все равно отправляем основной человеческий текст (анализ)
+        # await bot.send_message(user_id, text=final_html_response, parse_mode="HTML")
+        #
+        # # # 4. Генерация графика с обработкой ошибок
+        # # # Убедимся, что есть достаточно данных для графика
+        # # if kline_len >= 2:  # Минимальное количество свечей для построения графика
+        # #     try:
+        # #         chart_buf = plot_chart(
+        # #             market_data,
+        # #             timeframe_code,
+        # #             is_vip=is_vip,
+        # #             forecast_series=market_data.get("forecast"),
+        # #             forecast_confidence=market_data.get("forecast_confidence"),
+        # #             metrics_to_show=metrics_to_show
+        # #         )
+        # #
+        # #         if chart_buf:
+        # #             chart_buf.seek(0)
+        # #             photo_input = BufferedInputFile(file=chart_buf.read(), filename='chart.png')
+        # #             await bot.send_photo(chat_id=user_id, photo=photo_input, parse_mode="HTML")
+        # #         else:
+        # #             logging.error("plot_chart вернул None")
+        # #             await bot.send_message(user_id, "⚠️ Не удалось построить график. Вот текстовый анализ:")
+        # #
+        # #         # chart_buf.seek(0)
+        # #         # photo_input = BufferedInputFile(file=chart_buf.read(), filename='chart.png')
+        # #         # await bot.send_photo(chat_id=user_id, photo=photo_input, parse_mode="HTML")
+        # #     except Exception as e:  # Ловим ошибки при построении графика
+        # #         logging.error(f"Error during chart plotting: {e}\n{traceback.format_exc()}")
+        # #         await bot.send_message(user_id, text="⚠️ Не удалось построить график. Вот текстовый анализ:")
+        # # else:
+        # #     logging.warning(f"Not enough data for plotting chart ({kline_len} candles). Skipping chart.")
+        # #     await bot.send_message(user_id,
+        # #                            text="⚠️ Недостаточно исторических данных для построения графика. Вот текстовый анализ:")
+        # #
+        # # # Отправляем текстовый прогноз
+        # # await bot.send_message(user_id, text=final_html_response, parse_mode="HTML")
+        #
+        #     # main_2_updated.py -> в функции confirm_market_prognoz
+        #
+        #     # ... (код до генерации графика) ...
+        #
+        # # 4. Генерация графика с новыми данными
+        # chart_buf = None
+        # if kline_len >= 2:
+        #     try:
+        #         # Извлекаем данные из JSON ответа LLM
+        #         forecast_data = parsed_struct.get("forecast")
+        #         confidence_data = parsed_struct.get("forecast_confidence")
+        #         signals_data = parsed_struct.get("signals")
+        #         metrics_to_show_data = parsed_struct.get("metrics_to_show")
+        #
+        #         chart_buf = plot_chart(
+        #             market_data,
+        #             timeframe=timeframe_code,  # Используем код таймфрейма, например '1d'
+        #             is_vip=is_vip,
+        #             forecast_series=forecast_data,
+        #             forecast_confidence=confidence_data,
+        #             signals=signals_data,
+        #             metrics_to_show=metrics_to_show_data
+        #         )
+        #
+        #         if chart_buf:
+        #             photo_input = BufferedInputFile(file=chart_buf.read(), filename='chart.png')
+        #             await bot.send_photo(chat_id=user_id, photo=photo_input, parse_mode="HTML")
+        #         else:
+        #             logging.error("plot_chart вернул None, график не будет отправлен.")
+        #             await bot.send_message(user_id, "⚠️ Не удалось построить график. Вот текстовый анализ:")
+        #
+        #     except Exception as e:
+        #         logging.error(f"Ошибка при построении графика: {e}\n{traceback.format_exc()}")
+        #         await bot.send_message(user_id, text="⚠️ Не удалось построить график. Вот текстовый анализ:")
+        # else:
+        #     logging.warning(f"Недостаточно данных для графика ({kline_len} свечей). Пропускаем.")
+        #     await bot.send_message(user_id,
+        #                            text="⚠️ Недостаточно исторических данных для графика. Вот текстовый анализ:")
+        #
+        # # Отправляем текстовый прогноз (как и раньше)
+        # await bot.send_message(user_id, text=final_html_response, parse_mode="HTML")
+
+        # 3. Выполняем запрос к LLM
         resp = client.chat.completions.create(
             model="gemini-2.5-pro-preview",
             messages=messages,
             temperature=0.4
         )
 
-        final_html_response = resp.choices[0].message.content.strip()
-        final_html_response = sanitize_telegram_html(final_html_response)
+        raw_llm = resp.choices[0].message.content
+        final_html_response = sanitize_telegram_html(
+            re.sub(r"```json[\s\S]*?```", "", raw_llm, flags=re.IGNORECASE).strip())
 
-        # 6. Генерация графика с обработкой ошибок
+        # Пытаемся извлечь JSON-блок (если есть)
+        parsed_struct = parse_llm_json_from_text(raw_llm)
+        if not parsed_struct:
+            logging.warning(
+                "⚠️ JSON-блок не найден или не удалось распарсить. Попробуем продолжить с локальными метриками.")
+        else:
+            logging.info(f"✅ JSON-блок извлечён: keys={list(parsed_struct.keys())}")
+
+        # Получаем локальные vip_metrics и metrics_to_show
+        local_vip = market_data.get("vip_metrics", {}) or {}
+        local_metrics_list = market_data.get("metrics_to_show", []) or []
+
+        # LLM vip_metrics (если есть)
+        llm_vip = parsed_struct.get("vip_metrics", {}) if isinstance(parsed_struct, dict) else {}
+        llm_metrics_list = parsed_struct.get("metrics_to_show") if isinstance(parsed_struct, dict) else None
+
+        # Merge: локальные метрики имеют приоритет
+        final_vip = merge_metrics(local_vip, llm_vip)
+
+        # Final metrics_to_show (LLM предпочтим, если он явно указал)
+        final_metrics_list = llm_metrics_list if llm_metrics_list else local_metrics_list
+
+        # Собираем final_forecast_json для plot_chart
+        final_forecast_json = parsed_struct.copy() if isinstance(parsed_struct, dict) else {}
+        # Если LLM не прислал forecast — render_forecast_and_plot и plot_chart умеют сделать fallback,
+        # однако здесь мы сделаем базовый fallback: скопируем последние цены как flat forecast
+        if 'forecast' not in final_forecast_json or not final_forecast_json.get('forecast'):
+            # build simple close_series forecast using last price
+            hist_df = market_data.get('kline_data')
+            last_dt = hist_df['dt'].iloc[-1]
+            last_price = float(hist_df['close'].iloc[-1])
+            # choose steps according to timeframe:
+            horizon_steps = {"5m": 12, "1h": 24, "1d": 14, "1w": 12, "1m": 30, "6m": 26, "1y": 12}
+            steps = horizon_steps.get(timeframe_code, 12)
+            # step length in minutes:
+            if timeframe_code.endswith('m'):
+                step_min = int(timeframe_code[:-1])
+            elif timeframe_code.endswith('h'):
+                step_min = int(timeframe_code[:-1]) * 60
+            elif timeframe_code.endswith('d'):
+                step_min = 1440
+            elif timeframe_code.endswith('w'):
+                step_min = 7 * 1440
+            else:
+                step_min = 60
+            fc_rows = []
+            for i in range(1, steps + 1):
+                ts = int((last_dt + timedelta(minutes=step_min * i)).timestamp() * 1000)
+                fc_rows.append([ts, last_price])
+            final_forecast_json['forecast'] = {"type": "close_series", "data": fc_rows}
+            final_forecast_json['forecast_horizon'] = {"label": timeframe_code, "ms": step_min * 60 * 1000}
+
+        # подставляем merged vip_metrics + metrics_to_show + x_axis если LLM дал
+        final_forecast_json['vip_metrics'] = final_vip
+        final_forecast_json['metrics_to_show'] = final_metrics_list
+        if parsed_struct and parsed_struct.get('x_axis'):
+            final_forecast_json['x_axis'] = parsed_struct.get('x_axis')
+
+        # Нормализуем history_df
+        history_df = market_data.get('kline_data')
+        if not isinstance(history_df, pd.DataFrame):
+            try:
+                # допустим клайны как list-of-lists
+                history_df = normalize_kline_to_df(history_df)
+            except Exception:
+                history_df = None
+
+        # Наконец — строим график
         try:
-            kline_len = len(market_data['kline_data'])
-            if kline_len < 2:
-                raise ValueError(f"Insufficient data: only {kline_len} candles")
-            elif kline_len < 14:
-                logging.warning(f"Limited data ({kline_len} candles), plotting basic chart")
-            chart_buf = plot_chart(market_data, timeframe_code, is_vip=is_vip)
-            chart_buf.seek(0)
-            photo_input = BufferedInputFile(file=chart_buf.read(), filename='chart.png')
-            await bot.send_photo(chat_id=user_id, photo=photo_input, parse_mode="HTML")
-            await bot.send_message(user_id, text=final_html_response, parse_mode="HTML")
-        except ValueError as ve:
-            logging.error(f"График error: {ve}")
-            await bot.send_message(user_id, text="⚠️ График недоступен (недостаточно исторических данных). Вот текстовый анализ:")
-            await bot.send_message(user_id, text=final_html_response, parse_mode="HTML")
+            # png_bytes = plot_chart(final_forecast_json, history_df=history_df, horizon=timeframe_code,
+            #                        mode=("vip" if is_vip else "standard"), output_path=None,
+            #                        asset_name=asset_name, created_at=datetime.datetime.utcnow())
+            #
+
+            # Вызов вашей функции отрисовки (убедитесь, что plot_chart_v4 принимает эти параметры)
+            png_bytes = plot_chart_v4(final_forecast_json, history_df=history_df, horizon=timeframe_code,
+                                      mode=("vip" if is_vip else "standard"), output_path=None, asset_name=asset_name,
+                                      created_at=datetime.datetime.now(timezone.utc))
+            # png_bytes = plot_chart_v4(final_forecast_json, history_df=history_df, horizon=timeframe_code,
+            #                         is_vip=is_vip, asset_name=asset_name, created_at=datetime.datetime.now(timezone.utc))
+            if png_bytes:
+                # 🛠️ FIX: Pass the raw bytes directly to BufferedInputFile
+                input_file = BufferedInputFile(file=png_bytes, filename="chart.png")
+                await bot.send_photo(chat_id=user_id, photo=input_file, parse_mode="HTML")
+                # bio = BytesIO(png_bytes)
+                # bio.name = "chart.png"
+                # bio.seek(0)
+                # await bot.send_photo(chat_id=user_id, photo=InputFile(bio, filename="chart.png"))
+            else:
+                logging.error("plot_chart вернул пустой результат")
+                await bot.send_message(user_id, "⚠️ Не удалось построить график. Ниже — текстовый анализ:")
         except Exception as e:
-            logging.error(f"Unexpected graph error: {e}\n{traceback.format_exc()}")
-            await bot.send_message(user_id, text=final_html_response, parse_mode="HTML")
+            logging.error(f"Ошибка при построении графика вручную: {e}\n{traceback.format_exc()}")
+            await bot.send_message(user_id, "⚠️ Не удалось построить график. Ниже — текстовый анализ:")
+
+
+        # Отправляем текстовый прогноз
+        await bot.send_message(user_id, text=final_html_response, parse_mode="HTML")
+
+
+
 
     except Exception as e:
         logging.error(f"Ошибка при генерации рыночного прогноза: {e}\n{traceback.format_exc()}")
@@ -2971,6 +3441,7 @@ async def confirm_market_prognoz(cb: types.CallbackQuery, state: FSMContext):
         await state.clear()
         await asyncio.sleep(1)
         await process_profile_redirect(user_id)
+
 
 # ============================================
 # Основные обработчики команд и сообщений
@@ -4292,7 +4763,22 @@ async def on_startup():
     # await setup_bot_commands()
     # await init_payments_db()  # ✅ добавь вот эту строку
     # await init_payouts_db()
-    load_coins_list()
+    # global coins_data
+    # coins_data = await get_bybit_symbols()
+    # if not coins_data:
+    #     coins_data = load_coins_list()['coins']  # Fallback на CoinGecko
+    # logging.info(f"Loaded {len(coins_data)} symbols")
+    global coins_data
+    coins_data = await get_bybit_symbols()
+    if coins_data:
+        # Если данные от Bybit получены, сохраняем их в файл
+        save_coins_list(coins_data)
+        logging.info(f"Loaded and saved {len(coins_data)} symbols from Bybit API")
+    else:
+        # В случае ошибки загрузки от Bybit, используем локальный файл
+        coins_data = load_coins_list()['coins']
+        logging.warning("Failed to load symbols from Bybit. Using local coins.json fallback.")
+    logging.info(f"Final loaded symbols count: {len(coins_data)}")
 
 
 async def main():
@@ -4307,6 +4793,7 @@ async def main():
     # await setup_bot_commands()
     # 2) Регистрируем роутеры
     dp.include_router(router)
+    await on_startup()
     # 3) Запускаем polling
     await polling_with_retry(dp, bot)
 
